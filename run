@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+import os
+import shutil
+import subprocess
+import sys
+from argparse import REMAINDER, ArgumentParser, RawTextHelpFormatter
+from enum import Enum
+from pathlib import Path
+from typing import List, Union
+
+
+class _CliSubcommand(Enum):
+    SETUP = "setup"
+    BUILD = "build"
+    FLASH = "flash"
+    EXE = "exe"
+    SHELL = "shell"
+
+
+DESCRIPTION = """\
+This CLI tool 'run' (a.k.a. "Run Script") is the entry point for performing various commands to setup, build, flash, etc.
+High level features of this CLI tool
+- Wrapper of Docker + SCons. It utilizes both Docker and SCons to build firmware.
+- Wrapper of the SJTWO board flash script
+- Builds the Docker image required for building firmware.
+- Builds firmware, using the Docker image, and passthroughs command line arguments to SCons.
+
+# Basic Usage:
+
+The run script takes a subcommand to determine which operation to perform.
+
+./{filename} {{subcommand}}
+
+Subcommands:
+{subcommand_description}
+
+Example Usages:
+
+### setup ###
+
+# Build the docker image only
+./{filename} setup
+
+### build ###
+
+# Build firmware using all available CPU cores
+./{filename} build
+
+# See additional command line options for the firmware build.
+# For example: './{filename} build -- {{additional command line args}}'
+./{filename} build -- -h
+
+# Clean firmware build
+./{filename} build -- -c
+
+# Build firmware using only 1 CPU core
+./{filename} build -- -j1
+
+### flash ###
+# Flash firmware using the default input file path
+./{filename} flash
+
+# See additional command line options for the flash script
+./{filename} flash -- -h
+
+# Manually select a file to flash and select a device
+./{filename} flash -- -i {{.bin file path}} --port COM1
+
+How To Run:
+
+# On POSIX (Linux, Mac, etc.)
+./{filename} {{subcommand}}
+
+# On Windows:
+python ./{filename} {{subcommand}}
+""".format(
+    filename=Path(__file__).name,
+    subcommand_description="\n".join(
+        [
+            f"'{_CliSubcommand.SETUP.value}' Build the docker image only based on the contents of 'Dockerfile'",
+            f"'{_CliSubcommand.BUILD.value}' Build firmware using SCons",
+            f"'{_CliSubcommand.FLASH.value}' Flash firmware using the Python flash script",
+            f"'{_CliSubcommand.EXE.value}' Run an executable in the docker container",
+            f"'{_CliSubcommand.SHELL.value}' Open a shell to the docker container",
+        ],
+    ),
+)
+
+DOCKER_IMAGE_NAME = "sjtwo-c"
+FLASH_SCRIPT_FILEPATH = Path(__file__).parent.joinpath("nxp-programmer/flash.py")
+
+
+def get_args():
+    argument_parser = ArgumentParser(
+        description=DESCRIPTION, formatter_class=RawTextHelpFormatter
+    )
+
+    argument_parser.add_argument(
+        "subcommand",
+        choices=[enum.value for enum in _CliSubcommand],
+    )
+    args, unknown_args = argument_parser.parse_known_args()
+    args.subcommand = _CliSubcommand(args.subcommand)
+    return args, unknown_args
+
+
+def main():
+    exit_code = 1
+    args, unknown_args = get_args()
+
+    os.chdir(Path(__file__).parent)
+    os.environ["DOCKER_CLI_HINTS"] = "false"
+
+    # Ensure docker is installed and running
+    try:
+        ensure_docker_is_installed()
+        ensure_docker_daemon_is_running()
+        ensure_python_in_path()
+    except AssertionError as err:
+        print(err)
+        return 1  # Return early
+
+    # Ensure the docker image is built before attempting to process these subcommands
+    if args.subcommand not in [_CliSubcommand.SETUP]:
+        try:
+            ensure_docker_image_exists()
+        except RuntimeError as err:
+            print(err)
+            return 1  # Return early
+
+    # Set up SCons arguments
+    if args.subcommand == _CliSubcommand.SETUP:
+        exit_code = build_docker_image()
+    elif args.subcommand == _CliSubcommand.BUILD:
+        scons_command = ["scons"]
+        scons_command.append("--native-toolchain")
+        if unknown_args:
+            scons_command += unknown_args  # Passthrough arguments from this CLI
+        else:
+            scons_command.append("-j {}".format(os.cpu_count()))
+        exit_code = run_docker_container(docker_command=scons_command)
+    elif args.subcommand == _CliSubcommand.FLASH:
+        exit_code = flash_firmware(args=unknown_args)
+    elif args.subcommand == _CliSubcommand.EXE:
+        try:
+            exit_code = run_exe_in_docker_container(args=unknown_args)
+        except ValueError as err:
+            print(err)
+    elif args.subcommand == _CliSubcommand.SHELL:
+        run_shell_in_docker_container(args=unknown_args)
+        exit_code = 0
+    else:
+        print(f"Unhandled subcommand: {args.subcommand.value}")
+        return 1  # Return early
+
+    return exit_code
+
+
+def ensure_docker_is_installed():
+    """
+    Check if 'docker' is in PATH. Assume that if it's not in PATH, then it's not installed.
+    :raise AssertionError: If docker is not installed
+    """
+    if shutil.which("docker") is None:
+        raise AssertionError(
+            "Docker must be installed. To check if docker is installed correctly, run 'docker' on command line."
+        )
+
+
+def ensure_docker_daemon_is_running():
+    """
+    Check if the docker daemon (a.k.a. Docker Engine) is running in the background.
+    :raise AssertionError: If docker daemon is not running
+    """
+    completed_process = subprocess.run(
+        "docker info",
+        shell=True,
+        universal_newlines=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if completed_process.returncode != 0:
+        raise AssertionError(
+            "Docker daemon must be running. To check if the docker daemon is running, run 'docker info' on command line."
+        )
+
+
+def ensure_docker_image_exists(docker_image_name=DOCKER_IMAGE_NAME):
+    """
+    Conditionally check if the docker image exists. If not, then attempt to build it
+    :param docker_image_name: Name of docker image to check and conditionally build
+    :raise RuntimeError: If unable to build the docker image
+    """
+    # Check if the docker image exists. If not, then build it before proceeding
+    completed_process = subprocess.run(
+        f"docker images | grep {docker_image_name}",
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        shell=True,
+        universal_newlines=True,
+    )
+
+    if completed_process.returncode != 0:
+        if build_docker_image() != 0:
+            raise RuntimeError("Unable to build the prerequisite docker image")
+
+
+def ensure_python_in_path():
+    """
+    Check if 'python' or 'python3' is in PATH
+    :raise AssertionError:
+    """
+    python_exe_name = get_python_exe()
+    completed_process = subprocess.run(
+        f"{python_exe_name} --version",
+        shell=True,
+        universal_newlines=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if completed_process.returncode != 0:
+        raise AssertionError(
+            f"{python_exe_name} is not accessible by command line. Python needs to be added to PATH enviornment variable."
+        )
+
+
+def run_docker_container(
+    docker_image_name=DOCKER_IMAGE_NAME,
+    docker_command: Union[List[str], str] = None,
+) -> int:
+    """
+    Run a docker container
+    :param docker_image_name: Docker image to use to create a container
+    :param docker_command: Docker command to execute on the new container
+    :return: Exit code of docker run command
+    """
+    if type(docker_command) is str:
+        docker_command = [docker_command]
+    docker_command = docker_command or []
+
+    # Prefix the docker command; ensure all newly created files/directories are readable and writable by others
+    # to allow all users to access them freely
+    if docker_command:
+        docker_command[0] = f"umask 000;{docker_command[0]}"
+
+    command = 'docker run --rm -it --entrypoint /bin/bash {mount_arg} --name={docker_image_name} {docker_image_name} -c "{docker_command}"'.format(
+        docker_image_name=docker_image_name,
+        docker_command=" ".join(docker_command),
+        mount_arg="--mount src=.,target=/root/sjtwo-c,type=bind",
+    )
+    print(f"Running command:\n{command}")
+    completed_process = subprocess.run(
+        command,
+        shell=True,
+        universal_newlines=True,
+    )
+    return completed_process.returncode
+
+
+def build_docker_image(docker_image_name=DOCKER_IMAGE_NAME) -> int:
+    """
+    :param docker_image_name: Name of docker image to build
+    :return: Exit code of the docker build command
+    """
+    completed_process = subprocess.run(
+        f"docker build -t {docker_image_name} .",
+        shell=True,
+        universal_newlines=True,
+    )
+    return completed_process.returncode
+
+
+def flash_firmware(flash_pypath=FLASH_SCRIPT_FILEPATH, args: List[str] = None) -> int:
+    """
+    Run a flash script to flash firmware
+    :return: Exit code of flash script
+    """
+    args = args or []
+    ret = 1
+    command = f'{get_python_exe()} {flash_pypath} {" ".join(args)}'
+    print(f"Running command\n{command}")
+    try:
+        completed_process = subprocess.run(
+            command,
+            shell=True,
+            universal_newlines=True,
+        )
+        ret = completed_process.returncode
+    except KeyboardInterrupt:
+        ret = 0
+
+    return ret
+
+
+def run_exe_in_docker_container(args: List[str]) -> int:
+    """
+    Execute a given executable file path in the container
+    :param args: Executable file path or command followed by any optional command line arguments
+    - Interpret the first element as an executable file path
+    :return: Exit code of the docker run command
+    :raise: ValueError if no executable file path is given
+    """
+    if not args:
+        raise ValueError(
+            "Provide an executable or command (e.g. _build_x86_freertos/x86_freertos.exe)"
+        )
+    command = [normalize_path(args[0])]
+    if len(args) > 1:
+        command += args[1:]
+    return run_docker_container(docker_command=command)
+
+
+def run_shell_in_docker_container(args: List[str]) -> int:
+    """
+    Execute bash to spawn a shell session in the container
+    :return: Exit code of the docker run command
+    """
+    command = ["/bin/bash"] + args
+    return run_docker_container(docker_command=command)
+
+
+def get_python_exe() -> str:
+    """
+    :return: python executable file name, python3 if it exists in PATH else return python.
+    For Windows, use python unconditionally. Windows comes installed with both stub `python3` and `python` programs that
+    points to the Microsoft Store where the actual Python can be installed.
+    Manual Python installations from the Python website directly come with `python` only.
+    """
+
+    ret = "python"
+    if "win32" != sys.platform:
+        test_exe_name = ["python", "python3"]
+        for exe_name in test_exe_name:
+            if shutil.which(exe_name):
+                ret = exe_name
+    return ret
+
+
+def normalize_path(path: str) -> str:
+    r"""
+    Transform the given path to POSIX path if given a Windows path if this environment is POSIX.
+    Otherwise, leave it as a Windows path.
+    Example cases:
+    - "/tmp/subdir\\file" => "/tmp/subdir/file"
+    - "/tmp/subdir/file" => "/tmp/subdir/file"
+    """
+    if "\\" in path:
+        path = Path(path).as_posix()
+    return path
+
+
+if __name__ == "__main__":
+    sys.exit(main())
